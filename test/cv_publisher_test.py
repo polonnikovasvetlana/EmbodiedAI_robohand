@@ -1,0 +1,387 @@
+import cv2
+import json
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    HistoryPolicy,
+    DurabilityPolicy,
+)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+COLOR_TOPIC = "/camera/camera/color/image_raw"
+DETECTION_TOPIC = "/detected_objects"
+
+
+# ============================================================
+# QOS
+# ============================================================
+
+SENSOR_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+
+# ============================================================
+# NODE
+# ============================================================
+
+class CVVisualizerNode(Node):
+
+    def __init__(self):
+
+        super().__init__(
+            "cv_visualizer_node"
+        )
+
+        self.objects = []
+
+        # ====================================================
+        # SUBSCRIBERS
+        # ====================================================
+
+        self.image_subscription = (
+            self.create_subscription(
+                Image,
+                COLOR_TOPIC,
+                self.image_callback,
+                SENSOR_QOS
+            )
+        )
+
+        self.objects_subscription = (
+            self.create_subscription(
+                String,
+                DETECTION_TOPIC,
+                self.objects_callback,
+                1
+            )
+        )
+
+        self.get_logger().info(
+            "CV visualizer started."
+        )
+
+        self.get_logger().info(
+            f"RGB: {COLOR_TOPIC}"
+        )
+
+        self.get_logger().info(
+            f"Detections: {DETECTION_TOPIC}"
+        )
+
+
+    # ========================================================
+    # DETECTIONS
+    # ========================================================
+
+    def objects_callback(self, msg):
+
+        try:
+
+            data = json.loads(
+                msg.data
+            )
+
+            self.objects = data.get(
+                "objects",
+                []
+            )
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f"Detection message error: {e}"
+            )
+
+
+    # ========================================================
+    # IMAGE
+    # ========================================================
+
+    def image_callback(self, msg):
+
+        try:
+
+            frame = self.image_to_numpy(
+                msg
+            )
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f"Image conversion error: {e}"
+            )
+
+            return
+
+        # ====================================================
+        # DRAW DETECTIONS
+        # ====================================================
+
+        for obj in self.objects:
+
+            object_id = obj.get(
+                "id",
+                -1
+            )
+
+            object_type = obj.get(
+                "type",
+                "object"
+            )
+
+            color = obj.get(
+                "color",
+                "unknown"
+            )
+
+            height = obj.get(
+                "height_mm",
+                0.0
+            )
+
+            cx, cy = obj.get(
+                "position",
+                [0, 0]
+            )
+
+            # =================================================
+            # CONTOUR
+            # =================================================
+
+            contour_data = obj.get(
+                "contour",
+                []
+            )
+
+            if contour_data:
+
+                contour = np.asarray(
+                    contour_data,
+                    dtype=np.int32
+                ).reshape(
+                    -1,
+                    1,
+                    2
+                )
+
+                cv2.drawContours(
+                    frame,
+                    [contour],
+                    -1,
+                    (0, 255, 0),
+                    2
+                )
+
+                x, y, w, h = (
+                    cv2.boundingRect(
+                        contour
+                    )
+                )
+
+            else:
+
+                x = cx - 30
+                y = cy - 30
+                w = 60
+                h = 60
+
+            # =================================================
+            # CENTER
+            # =================================================
+
+            cv2.circle(
+                frame,
+                (int(cx), int(cy)),
+                5,
+                (0, 0, 255),
+                -1
+            )
+
+            # =================================================
+            # TEXT
+            # =================================================
+
+            cv2.putText(
+                frame,
+                f"Object {object_id}",
+                (
+                    x,
+                    max(y - 30, 20)
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"{color} {object_type}",
+                (
+                    x,
+                    max(y - 10, 20)
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"position: ({cx}, {cy})",
+                (
+                    x,
+                    y + h + 18
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (0, 0, 255),
+                1
+            )
+
+            cv2.putText(
+                frame,
+                f"height: {height:.0f} mm",
+                (
+                    x,
+                    y + h + 35
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 0, 0),
+                1
+            )
+
+        # ====================================================
+        # WINDOW
+        # ====================================================
+
+        cv2.imshow(
+            "Object detection",
+            frame
+        )
+
+        key = (
+            cv2.waitKey(1)
+            & 0xFF
+        )
+
+        if key == ord("q"):
+
+            if rclpy.ok():
+                rclpy.shutdown()
+
+
+    # ========================================================
+    # ROS IMAGE -> OPENCV
+    # ========================================================
+
+    def image_to_numpy(self, msg):
+
+        encoding = msg.encoding.lower()
+
+        if encoding not in (
+            "rgb8",
+            "bgr8"
+        ):
+
+            raise RuntimeError(
+                f"Unsupported image encoding: "
+                f"{msg.encoding}"
+            )
+
+        raw = np.frombuffer(
+            msg.data,
+            dtype=np.uint8
+        )
+
+        rows = raw.reshape(
+            msg.height,
+            msg.step
+        )
+
+        frame = rows[
+            :,
+            :msg.width * 3
+        ].reshape(
+            msg.height,
+            msg.width,
+            3
+        )
+
+        # RealSense обычно публикует RGB8,
+        # OpenCV ожидает BGR
+        if encoding == "rgb8":
+
+            frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_RGB2BGR
+            )
+
+        else:
+
+            frame = frame.copy()
+
+        return frame
+
+
+    # ========================================================
+    # DESTROY
+    # ========================================================
+
+    def destroy_node(self):
+
+        cv2.destroyAllWindows()
+
+        super().destroy_node()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main(args=None):
+
+    rclpy.init(
+        args=args
+    )
+
+    node = CVVisualizerNode()
+
+    try:
+
+        rclpy.spin(
+            node
+        )
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        node.destroy_node()
+
+        if rclpy.ok():
+
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
