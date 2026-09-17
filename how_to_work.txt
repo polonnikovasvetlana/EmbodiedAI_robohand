@@ -1,0 +1,23 @@
+1
+
+
+source /opt/ros/jazzy/setup.bash
+source ~/so101_real_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+ros2 launch so101_bringup follower_moveit_demo.launch.py
+
+
+
+2
+
+
+
+cd ~/AgenticBotIW
+source /opt/ros/jazzy/setup.bash
+source ~/so101_real_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+PYTHONPATH="$PWD:$PYTHONPATH" /usr/bin/python3 test/test_so101_control.py
