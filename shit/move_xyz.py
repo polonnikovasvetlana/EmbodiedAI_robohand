@@ -38,8 +38,12 @@ MOTOR_NAMES = [
 ]
 ARM_MOTOR_NAMES = MOTOR_NAMES[:-1]
 
-# Conservative base-frame workspace. Adjust only after checking your setup.
-# X: forward, Y: left, Z: up, all in metres.
+# Official LeRobot examples pass absolute base-frame XYZ to IK without a frame
+# remap. Keep the user frame identical to the SO-101 URDF base frame.
+USER_TO_URDF_XYZ = np.array([1.0, 1.0, 1.0], dtype=float)
+
+# Conservative user-frame workspace. Adjust only after checking your setup.
+# X: forward, Y: left, Z: physically up, all in metres.
 WORKSPACE_MIN = np.array([0.05, -0.30, -0.05], dtype=float)
 WORKSPACE_MAX = np.array([0.42, 0.30, 0.40], dtype=float)
 MIN_DISTANCE_FROM_BASE_M = 0.07
@@ -51,6 +55,7 @@ CONTROL_HZ = 20.0
 MAX_ARM_SPEED_DEG_S = 20.0
 MAX_GRIPPER_SPEED_UNITS_S = 25.0
 MAX_RELATIVE_TARGET = 2.0
+MAX_CARTESIAN_WAYPOINT_M = 0.005
 
 # Gripper commands use its calibrated 0..100 scale (not degrees): 100 is fully
 # open, 0 is fully closed. Closing stops on a stable position before zero,
@@ -63,9 +68,10 @@ GRIPPER_STALL_WINDOW = 8
 GRIPPER_STALL_MOVEMENT = 0.5
 GRIPPER_TIMEOUT_S = 10.0
 
-# The SO-101 has five arm joints, so arbitrary 6-DoF poses are not always
-# possible. A soft orientation task is the approach used by LeRobot examples.
-IK_ORIENTATION_WEIGHT = 0.01
+# The SO-101 has only five arm joints and cannot realize an arbitrary 6-DoF
+# pose. LeRobot explicitly supports 0.0 for position-only IK. This makes XYZ of
+# gripper_frame_link the priority and lets orientation change as needed.
+IK_ORIENTATION_WEIGHT = 0.0
 IK_MAX_ITERATIONS = 150
 IK_POSITION_TOLERANCE_M = 0.008
 
@@ -135,10 +141,20 @@ def format_joints(joints: np.ndarray) -> str:
     return ", ".join(values)
 
 
+def user_to_urdf_xyz(xyz: np.ndarray) -> np.ndarray:
+    """Convert user XYZ to the official URDF base frame (currently identity)."""
+    return np.asarray(xyz, dtype=float) * USER_TO_URDF_XYZ
+
+
+def urdf_to_user_xyz(xyz: np.ndarray) -> np.ndarray:
+    """Convert official FK output to user XYZ (currently identity)."""
+    return np.asarray(xyz, dtype=float) * USER_TO_URDF_XYZ
+
+
 def print_state(robot: SO101Follower, kinematics: RobotKinematics) -> np.ndarray:
     joints = read_joints(robot)
     pose = kinematics.forward_kinematics(joints)
-    xyz = pose[:3, 3]
+    xyz = urdf_to_user_xyz(pose[:3, 3])
     print(f"Current joints: {format_joints(joints)}")
     print(
         f"Current EE XYZ: x={xyz[0]:.4f}, y={xyz[1]:.4f}, z={xyz[2]:.4f} m "
@@ -148,10 +164,11 @@ def print_state(robot: SO101Follower, kinematics: RobotKinematics) -> np.ndarray
 
 
 def print_axes() -> None:
-    print("Base coordinate frame (origin = URDF base_link):")
+    print("Official SO-101 base frame (origin = URDF base_link):")
     print("  +X: forward from the base")
     print("  +Y: left when looking in the +X direction")
-    print("  +Z: upward; negative Z is below the base_link origin")
+    print("  +Z: upward")
+    print("  -Z: downward")
     print("  Relative commands x/y/z use millimetres.")
 
 
@@ -332,6 +349,8 @@ def move_to_xyz(
     joint_limits: dict[str, tuple[float, float]],
     current_joints: np.ndarray | None = None,
 ) -> None:
+    # requested_xyz is in the same absolute base frame used by the official
+    # LeRobot examples and RobotKinematics.
     print(
         f"Requested XYZ: x={requested_xyz[0]:.4f}, "
         f"y={requested_xyz[1]:.4f}, z={requested_xyz[2]:.4f} m "
@@ -339,22 +358,41 @@ def move_to_xyz(
         f"{requested_xyz[2] * 1000:.1f} mm)"
     )
     validate_xyz(requested_xyz)
+    requested_urdf_xyz = user_to_urdf_xyz(requested_xyz)
 
     if current_joints is None:
         current_joints = print_state(robot, kinematics)
-    target_joints, position_error, orientation_error = solve_ik(
-        kinematics,
-        current_joints,
-        requested_xyz,
-        fixed_rotation,
-        joint_limits,
-    )
+
+    # Plan the whole straight Cartesian path before moving anything. Directly
+    # interpolating only the final joint angles can make the shoulder/wrist
+    # reconfigure while the gripper tip barely moves. Sequential IK waypoints
+    # keep gripper_frame_link on the requested line.
+    start_urdf_xyz = kinematics.forward_kinematics(current_joints)[:3, 3].copy()
+    distance_m = float(np.linalg.norm(requested_urdf_xyz - start_urdf_xyz))
+    waypoint_count = max(1, math.ceil(distance_m / MAX_CARTESIAN_WAYPOINT_M))
+    path: list[np.ndarray] = []
+    q_guess = current_joints.copy()
+    position_error = 0.0
+    orientation_error = 0.0
+
+    for step in range(1, waypoint_count + 1):
+        alpha = step / waypoint_count
+        waypoint_xyz = start_urdf_xyz + alpha * (requested_urdf_xyz - start_urdf_xyz)
+        q_guess, position_error, orientation_error = solve_ik(
+            kinematics,
+            q_guess,
+            waypoint_xyz,
+            fixed_rotation,
+            joint_limits,
+        )
+        path.append(q_guess.copy())
+
+    target_joints = path[-1]
     print(f"IK joint target: {format_joints(target_joints)}")
-    print(
-        f"IK check: XYZ error={position_error * 1000:.1f} mm, "
-        f"orientation error={orientation_error:.2f} deg"
-    )
-    move_slowly(robot, target_joints)
+    print(f"IK check: XYZ error={position_error * 1000:.1f} mm (position-only IK)")
+    print(f"Moving gripper tip along {waypoint_count} Cartesian waypoint(s)...")
+    for waypoint_joints in path:
+        move_slowly(robot, waypoint_joints)
     print_state(robot, kinematics)
 
 
@@ -366,7 +404,7 @@ def run_terminal(robot: SO101Follower, kinematics: RobotKinematics, urdf_path: P
     home_joints = startup_joints.copy()
 
     print("\nThe current pose is saved as 'home'.")
-    print("Cartesian orientation is fixed to the current gripper orientation.")
+    print("IK controls gripper position; orientation is free (position-only mode).")
     print_axes()
     print("Commands:")
     print("  123 0 20 - absolute XYZ in millimetres")
@@ -433,7 +471,9 @@ def run_terminal(robot: SO101Follower, kinematics: RobotKinematics, urdf_path: P
                     raise ValueError("Axis command format: x 15, y -10, or z 5 (millimetres).")
                 delta_mm = float(fields[1])
                 current_joints = print_state(robot, kinematics)
-                requested_xyz = kinematics.forward_kinematics(current_joints)[:3, 3].copy()
+                requested_xyz = urdf_to_user_xyz(
+                    kinematics.forward_kinematics(current_joints)[:3, 3]
+                )
                 axis = {"x": 0, "y": 1, "z": 2}[first]
                 requested_xyz[axis] += delta_mm / 1000.0
                 print(f"Relative {first.upper()} motion: {delta_mm:+.1f} mm")
