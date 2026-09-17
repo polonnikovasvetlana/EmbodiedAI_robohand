@@ -16,6 +16,7 @@ from geometry_msgs.msg import Pose, Quaternion
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     Constraints,
+    JointConstraint,
     MoveItErrorCodes,
     OrientationConstraint,
     PositionConstraint,
@@ -110,6 +111,12 @@ class SO101Config:
     manage_pick_ik_position_only: bool = True
     parameter_timeout: float = 2.0
 
+    # Keep the jaws from rolling around the tool axis while MoveIt is
+    # otherwise free to choose an orientation that reaches the XYZ goal.
+    preserve_wrist_roll: bool = True
+    wrist_roll_joint: str = "wrist_roll"
+    wrist_roll_tolerance_rad: float = 0.02
+
     # Сначала пробуем естественный yaw.
     # Потом чуть крутим его, но не меняем наклон схвата.
     yaw_search_deg: tuple[float, ...] = (
@@ -144,6 +151,20 @@ class SO101Config:
     gripper_closed_position: float = -0.16
 
     gripper_tolerance_rad: float = 0.03
+
+    # Current feedback is supplied by the patched Feetech driver in amperes.
+    # The STS3215 is about 0.18 A with no load, so 0.25 A intentionally
+    # favors early/false contact over excessive squeeze. Tune only with
+    # disposable test objects, never a hand.
+    gripper_contact_current_amp: float = 0.25
+    gripper_contact_samples: int = 2
+    gripper_current_poll_interval: float = 0.02
+    gripper_close_timeout: float = 25.0
+
+    # After current-triggered contact, hold the measured position. A zero
+    # preload avoids adding extra squeeze; increase only after safe testing.
+    gripper_grasp_preload_rad: float = 0.0
+    gripper_hold_timeout: float = 3.0
 
     server_timeout: float = 10.0
     command_timeout: float = 30.0
@@ -279,6 +300,8 @@ class SO101Arm:
 
         self._last_joint_state = None
         self._joint_positions = {}
+        self._joint_efforts = {}
+        self._joint_state_seq = 0
 
         self._fixed_orientation = None
 
@@ -415,6 +438,17 @@ class SO101Arm:
                 )
             }
 
+            self._joint_efforts = {
+                name: float(effort)
+                for name, effort
+                in zip(
+                    msg.name,
+                    msg.effort,
+                )
+            }
+
+            self._joint_state_seq += 1
+
     def _current_joint_state(
         self,
     ):
@@ -448,6 +482,45 @@ class SO101Arm:
             return None
 
         return float(value)
+
+    def _get_joint_effort(
+        self,
+        name: str,
+    ):
+
+        with self._state_lock:
+
+            value = self._joint_efforts.get(
+                name
+            )
+
+        if (
+            value is None
+            or not math.isfinite(value)
+        ):
+            return None
+
+        return float(value)
+
+    def _get_joint_effort_sample(
+        self,
+        name: str,
+    ):
+
+        with self._state_lock:
+
+            sequence = self._joint_state_seq
+            value = self._joint_efforts.get(
+                name
+            )
+
+        if (
+            value is None
+            or not math.isfinite(value)
+        ):
+            return sequence, None
+
+        return sequence, float(value)
 
     # ========================================================
     # FUTURES
@@ -582,6 +655,21 @@ class SO101Arm:
             qz=rotation.z,
             qw=rotation.w,
         )
+
+    def get_gripper_current(self) -> float:
+
+        current = self._get_joint_effort(
+            self.config.gripper_joint
+        )
+
+        if current is None:
+
+            raise RuntimeError(
+                "Gripper current feedback is "
+                "not available."
+            )
+
+        return abs(current)
 
     # ========================================================
     # ORIENTATION
@@ -904,6 +992,47 @@ class SO101Arm:
 
         goal_constraints = []
 
+        wrist_roll_constraint = None
+
+        if (
+            not self.config.constrain_orientation
+            and self.config.preserve_wrist_roll
+        ):
+
+            wrist_roll = self._get_joint_position(
+                self.config.wrist_roll_joint
+            )
+
+            if wrist_roll is None:
+
+                raise RuntimeError(
+                    "No wrist roll joint state."
+                )
+
+            wrist_roll_constraint = (
+                JointConstraint()
+            )
+
+            wrist_roll_constraint.joint_name = (
+                self.config.wrist_roll_joint
+            )
+
+            wrist_roll_constraint.position = (
+                wrist_roll
+            )
+
+            wrist_roll_constraint.tolerance_above = (
+                self.config
+                .wrist_roll_tolerance_rad
+            )
+
+            wrist_roll_constraint.tolerance_below = (
+                self.config
+                .wrist_roll_tolerance_rad
+            )
+
+            wrist_roll_constraint.weight = 1.0
+
         if self.config.constrain_orientation:
 
             for (
@@ -982,6 +1111,12 @@ class SO101Arm:
                 position
             ]
 
+            if wrist_roll_constraint is not None:
+
+                constraints.joint_constraints = [
+                    wrist_roll_constraint
+                ]
+
             goal_constraints.append(
                 constraints
             )
@@ -1017,6 +1152,18 @@ class SO101Arm:
         request.goal_constraints = (
             goal_constraints
         )
+
+        if wrist_roll_constraint is not None:
+
+            request.path_constraints.name = (
+                "so101_hold_wrist_roll"
+            )
+
+            request.path_constraints.joint_constraints = [
+                copy.deepcopy(
+                    wrist_roll_constraint
+                )
+            ]
 
         request.start_state.is_diff = True
 
@@ -1198,6 +1345,24 @@ class SO101Arm:
                     "be in (0, pi]."
                 )
 
+        if self.config.preserve_wrist_roll:
+
+            wrist_tolerance = float(
+                self.config
+                .wrist_roll_tolerance_rad
+            )
+
+            if (
+                not math.isfinite(wrist_tolerance)
+                or wrist_tolerance <= 0.0
+                or wrist_tolerance > math.pi
+            ):
+
+                raise ValueError(
+                    "Wrist roll tolerance must "
+                    "be in (0, pi]."
+                )
+
         with (
             self._command_lock,
             self._position_only_ik_mode(),
@@ -1216,7 +1381,7 @@ class SO101Arm:
             orientation_mode = (
                 "locked orientation"
                 if self.config.constrain_orientation
-                else "position-only"
+                else "position-only, wrist roll held"
             )
 
             self._node.get_logger().info(
@@ -1398,6 +1563,135 @@ class SO101Arm:
     # GRIPPER
     # ========================================================
 
+    def _gripper_hold_target(
+        self,
+        contact_position: float,
+    ) -> float:
+
+        closing_direction = math.copysign(
+            1.0,
+            (
+                self.config
+                .gripper_closed_position
+                - self.config
+                .gripper_open_position
+            ),
+        )
+
+        preload = abs(
+            float(
+                self.config
+                .gripper_grasp_preload_rad
+            )
+        )
+
+        target = (
+            float(contact_position)
+            + closing_direction * preload
+        )
+
+        lower = min(
+            self.config.gripper_open_position,
+            self.config.gripper_closed_position,
+        )
+
+        upper = max(
+            self.config.gripper_open_position,
+            self.config.gripper_closed_position,
+        )
+
+        return min(
+            upper,
+            max(lower, target),
+        )
+
+    def _hold_gripper_after_contact(
+        self,
+        contact_position: float,
+    ):
+
+        hold_target = self._gripper_hold_target(
+            contact_position
+        )
+
+        goal = ParallelGripperCommand.Goal()
+
+        goal.command.name = [
+            self.config.gripper_joint
+        ]
+
+        goal.command.position = [
+            hold_target
+        ]
+
+        goal_handle = self._wait_future(
+            self._gripper_client
+            .send_goal_async(goal),
+            self.config.server_timeout,
+        )
+
+        if (
+            goal_handle is None
+            or not goal_handle.accepted
+        ):
+
+            return (
+                False,
+                hold_target,
+                "hold command was rejected",
+            )
+
+        with self._goal_lock:
+
+            self._current_gripper_goal = (
+                goal_handle
+            )
+
+        try:
+
+            wrapped_result = self._wait_future(
+                goal_handle.get_result_async(),
+                self.config.gripper_hold_timeout,
+            )
+
+            if wrapped_result is None:
+
+                goal_handle.cancel_goal_async()
+
+                return (
+                    False,
+                    hold_target,
+                    "hold command timed out",
+                )
+
+            result = wrapped_result.result
+
+            held = bool(
+                result.reached_goal
+                or result.stalled
+            )
+
+            return (
+                held,
+                hold_target,
+                (
+                    "held"
+                    if held
+                    else "hold position was not reached"
+                ),
+            )
+
+        finally:
+
+            with self._goal_lock:
+
+                if (
+                    self._current_gripper_goal
+                    is goal_handle
+                ):
+
+                    self._current_gripper_goal = None
+
     def set_gripper(
         self,
         position: float,
@@ -1415,6 +1709,24 @@ class SO101Arm:
                     self.config.gripper_joint
                 )
             )
+
+            if before is None:
+
+                return MotionResult(
+                    False,
+                    "No gripper state.",
+                )
+
+            if allow_stall:
+
+                return MotionResult(
+                    False,
+                    (
+                        "Velocity-stall grasping is "
+                        "disabled as unsafe. Use close(), "
+                        "which requires current feedback."
+                    ),
+                )
 
             self._node.get_logger().info(
                 f"GRIPPER → "
@@ -1511,14 +1823,6 @@ class SO101Arm:
                     .gripper_tolerance_rad
                 )
 
-                moved = (
-                    abs(
-                        after
-                        - before
-                    )
-                    > 0.01
-                )
-
                 if reached:
 
                     return MotionResult(
@@ -1526,22 +1830,6 @@ class SO101Arm:
                         (
                             f"Gripper reached "
                             f"{after:.3f}"
-                        ),
-                    )
-
-                if (
-                    allow_stall
-                    and
-                    result.stalled
-                    and
-                    moved
-                ):
-
-                    return MotionResult(
-                        True,
-                        (
-                            "Gripper stalled "
-                            "after moving."
                         ),
                     )
 
@@ -1577,13 +1865,299 @@ class SO101Arm:
             allow_stall=False,
         )
 
+    def _close_with_current_feedback(self):
+
+        threshold = float(
+            self.config
+            .gripper_contact_current_amp
+        )
+
+        samples_required = int(
+            self.config
+            .gripper_contact_samples
+        )
+
+        poll_interval = float(
+            self.config
+            .gripper_current_poll_interval
+        )
+
+        timeout = float(
+            self.config
+            .gripper_close_timeout
+        )
+
+        if (
+            not math.isfinite(threshold)
+            or threshold <= 0.0
+        ):
+            raise ValueError(
+                "Gripper contact current must "
+                "be finite and positive."
+            )
+
+        if samples_required < 1:
+            raise ValueError(
+                "Gripper contact samples must "
+                "be at least one."
+            )
+
+        if (
+            not math.isfinite(poll_interval)
+            or poll_interval <= 0.0
+        ):
+            raise ValueError(
+                "Gripper current poll interval "
+                "must be finite and positive."
+            )
+
+        if (
+            not math.isfinite(timeout)
+            or timeout <= 0.0
+        ):
+            raise ValueError(
+                "Gripper close timeout must "
+                "be finite and positive."
+            )
+
+        with self._command_lock:
+
+            before = self._get_joint_position(
+                self.config.gripper_joint
+            )
+
+            sequence, current = (
+                self._get_joint_effort_sample(
+                    self.config.gripper_joint
+                )
+            )
+
+            if before is None:
+
+                return MotionResult(
+                    False,
+                    "No gripper position state.",
+                )
+
+            if current is None:
+
+                return MotionResult(
+                    False,
+                    (
+                        "Current feedback is unavailable; "
+                        "close refused for safety. Rebuild "
+                        "and restart the Feetech driver."
+                    ),
+                )
+
+            if abs(current) >= threshold:
+
+                return MotionResult(
+                    False,
+                    (
+                        "Gripper current is already high "
+                        f"({abs(current):.3f} A); close "
+                        "refused for safety."
+                    ),
+                )
+
+            target = float(
+                self.config
+                .gripper_closed_position
+            )
+
+            goal = ParallelGripperCommand.Goal()
+
+            goal.command.name = [
+                self.config.gripper_joint
+            ]
+
+            goal.command.position = [target]
+
+            goal_handle = self._wait_future(
+                self._gripper_client
+                .send_goal_async(goal),
+                self.config.server_timeout,
+            )
+
+            if (
+                goal_handle is None
+                or not goal_handle.accepted
+            ):
+
+                return MotionResult(
+                    False,
+                    "Gripper rejected close command.",
+                )
+
+            with self._goal_lock:
+
+                self._current_gripper_goal = (
+                    goal_handle
+                )
+
+            result_future = (
+                goal_handle.get_result_async()
+            )
+
+            deadline = time.monotonic() + timeout
+            over_current_samples = 0
+            last_sequence = sequence
+
+            try:
+
+                while time.monotonic() < deadline:
+
+                    sequence, current = (
+                        self._get_joint_effort_sample(
+                            self.config.gripper_joint
+                        )
+                    )
+
+                    if sequence != last_sequence:
+
+                        last_sequence = sequence
+
+                        if (
+                            current is not None
+                            and abs(current) >= threshold
+                        ):
+                            over_current_samples += 1
+                        else:
+                            over_current_samples = 0
+
+                    if (
+                        over_current_samples
+                        >= samples_required
+                    ):
+
+                        contact_position = (
+                            self._get_joint_position(
+                                self.config.gripper_joint
+                            )
+                        )
+
+                        goal_handle.cancel_goal_async()
+
+                        if contact_position is None:
+
+                            return MotionResult(
+                                False,
+                                "Contact detected, but no "
+                                "gripper position is available.",
+                            )
+
+                        (
+                            held,
+                            hold_target,
+                            hold_message,
+                        ) = self._hold_gripper_after_contact(
+                            contact_position
+                        )
+
+                        if not held:
+
+                            return MotionResult(
+                                False,
+                                (
+                                    "Current contact detected at "
+                                    f"{abs(current):.3f} A, but "
+                                    f"{hold_message}."
+                                ),
+                            )
+
+                        return MotionResult(
+                            True,
+                            (
+                                "Object/contact detected at "
+                                f"{abs(current):.3f} A and "
+                                f"{contact_position:.3f} rad; "
+                                f"holding at {hold_target:.3f} rad."
+                            ),
+                        )
+
+                    if result_future.done():
+
+                        wrapped_result = (
+                            result_future.result()
+                        )
+
+                        after = self._get_joint_position(
+                            self.config.gripper_joint
+                        )
+
+                        if after is None:
+
+                            return MotionResult(
+                                False,
+                                "No gripper position state.",
+                            )
+
+                        reached = (
+                            abs(after - target)
+                            <= self.config
+                            .gripper_tolerance_rad
+                        )
+
+                        if (
+                            reached
+                            or wrapped_result
+                            .result.reached_goal
+                        ):
+
+                            return MotionResult(
+                                True,
+                                (
+                                    "Gripper closed fully; "
+                                    "no contact threshold "
+                                    "was reached."
+                                ),
+                            )
+
+                        self._hold_gripper_after_contact(
+                            after
+                        )
+
+                        return MotionResult(
+                            False,
+                            (
+                                "Gripper stopped without a "
+                                "reliable current contact signal; "
+                                "command aborted."
+                            ),
+                        )
+
+                    time.sleep(poll_interval)
+
+                goal_handle.cancel_goal_async()
+
+                position = self._get_joint_position(
+                    self.config.gripper_joint
+                )
+
+                if position is not None:
+                    self._hold_gripper_after_contact(
+                        position
+                    )
+
+                return MotionResult(
+                    False,
+                    "Gripper close timed out and was stopped.",
+                )
+
+            finally:
+
+                with self._goal_lock:
+
+                    if (
+                        self._current_gripper_goal
+                        is goal_handle
+                    ):
+                        self._current_gripper_goal = None
+
     def close(self):
 
-        return self.set_gripper(
-            self.config
-            .gripper_closed_position,
-            allow_stall=True,
-        )
+        return self._close_with_current_feedback()
 
     # ========================================================
     # STOP

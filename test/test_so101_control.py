@@ -15,6 +15,7 @@ def main():
     print("  open")
     print("  close")
     print("  gripper POSITION")
+    print("  current")
     print("  lock")
     print("  free")
     print("  stop")
@@ -132,6 +133,17 @@ def main():
                     arm.set_gripper(
                         float(parts[1])
                     )
+                )
+
+            # ================================================
+            # GRIPPER CURRENT
+            # ================================================
+
+            elif name == "current":
+
+                print(
+                    f"Gripper current: "
+                    f"{arm.get_gripper_current():.3f} A"
                 )
 
             # ================================================
