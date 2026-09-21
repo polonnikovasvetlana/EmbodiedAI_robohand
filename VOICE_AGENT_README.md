@@ -1,19 +1,24 @@
-# Whisper voice agent
+# Voice agent
 
-The `voice_agent` package converts English speech into structured command JSON
-using **faster-whisper** (CPU/int8, `tiny.en` by default). Microphone input uses
-sounddevice/PortAudio, with bounded mono recording and resampling to 16 kHz when
-needed. Audio files are also supported. Low-confidence or empty speech is rejected.
+The `voice_agent` package uses **faster-whisper** for English speech-to-text
+(`tiny.en`, CPU/int8). Microphone input uses sounddevice/PortAudio with bounded
+mono recording and resampling to 16 kHz when needed. Audio files are also supported;
+empty or low-confidence speech is rejected.
 
-Natural-language parsing uses a small deterministic grammar: `bring [me] [the|a]
-bottle|cup`, `pick up [the|a] bottle|cup`, and `stop`, with optional `please`.
-For example, “Pick up the bottle” becomes `{"action":"pick_up","object":"bottle"}`.
+Natural-language command parsing uses a small deterministic grammar for
+“Bring me the bottle/cup”, “Pick up the bottle/cup”, and “Stop”, with optional
+“please”. For example, “Pick up the bottle” produces:
+
+```json
+{"action":"pick_up","object":"bottle"}
+```
+
 Unsupported, negated, and compound commands are rejected.
 
-## Run
+## Examples
 
-Use Python 3.10+ from the repository root. Audio requires PortAudio and the
-dependencies below; parser and fixture pipeline commands need only Python.
+Run from the repository root with Python 3.10+. Audio needs PortAudio and the
+listed dependencies; the parser and mock pipeline need only Python.
 
 ```bash
 python -m pip install -r requirements-voice.txt
@@ -25,28 +30,25 @@ python -m voice_agent listen --detections examples/voice_detections.json
 python -m unittest discover -s tests_voice -v
 ```
 
-Audio commands load the model before prompting for microphone input. The first
-load may download model weights; `--model /path/to/model --local-files-only`
-uses a local model. `--device` selects an input and `--audio /path/to/command.wav`
-uses a recording. `speech_to_text.py` is the original standalone prototype;
-the package CLI provides validation and the command pipeline.
+Audio commands load the model, then prompt before recording. The first load may
+download model weights. Use `--device` to select a microphone or
+`--audio /path/to/command.wav` to transcribe a file.
 
-## Mock testing and control boundary
+## Testing and robot control
 
-The example detections are a mock fixture. The pipeline resolves a unique bottle
-or cup and rejects missing, stale, ambiguous, or low-confidence detections.
-Tests use mocked audio, Whisper, and ROS callbacks without hardware or downloads.
-Run only `tests_voice`; other repository test scripts can access physical hardware.
+The mock detection fixture lets the pipeline match commands to a unique bottle
+or cup without a camera. Tests mock audio, Whisper, and ROS callbacks; they check
+parsing, confidence, stale or ambiguous detections, and preview results. Run only
+`tests_voice`: other repository test scripts can access physical hardware.
 
-The AI layer is separated from physical robot control: results have
-`execution_allowed: false` and `robot_pose: null`. No movement is executed.
-`stop` is currently an intent only, not a physical emergency stop.
+The AI layer is separate from physical robot control. Results always contain
+`execution_allowed: false` and `robot_pose: null`; no movement is executed.
+“Stop” is an intent, not a physical emergency stop.
 
 ## Next steps
 
-Validate live ROS 2 transport using the optional `voice_agent.ros_node` preview
-bridge and real detections. Calibrate aligned RGB/depth and camera-to-robot TF,
-then develop a separate executor for MoveIt and SO-101 with fresh-target checks,
-collision checking, grasp policies, cancellation, and explicit execution control.
-Test that executor in simulation before separately authorized hardware testing.
-See [the detailed guide](docs/voice_agent.md) for topic contracts and setup.
+Validate the optional ROS 2 preview bridge with live detections. Calibrate aligned
+RGB/depth and camera-to-robot transforms, then build a separate MoveIt / SO-101
+executor with fresh-target checks, collision checking, grasp policies, and
+cancellation. Test in simulation before separately authorized hardware testing.
+See [the detailed guide](docs/voice_agent.md) for ROS topics and setup.
