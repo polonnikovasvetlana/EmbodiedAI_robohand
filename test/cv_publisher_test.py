@@ -1,5 +1,8 @@
 import cv2
 import json
+import sys
+from pathlib import Path
+
 import numpy as np
 
 import rclpy
@@ -7,6 +10,13 @@ from rclpy.node import Node
 
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+
+# Allow direct execution from the test directory to use project settings.
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from calibration_config import origin_pixel
 
 from rclpy.qos import (
     QoSProfile,
@@ -22,6 +32,9 @@ from rclpy.qos import (
 
 COLOR_TOPIC = "/camera/camera/color/image_raw"
 DETECTION_TOPIC = "/detected_objects"
+
+CALIBRATION_CROSS_SIZE = 28
+CALIBRATION_CROSS_THICKNESS = 5
 
 
 # ============================================================
@@ -256,18 +269,63 @@ class CVVisualizerNode(Node):
                 1
             )
 
+            position_mm = obj.get(
+                "position_mm",
+                [0.0, 0.0]
+            )
+
+            cv2.putText(
+                frame,
+                f"mm: X={position_mm[0]:.1f} Y={position_mm[1]:.1f}",
+                (
+                    x,
+                    y + h + 52
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (0, 0, 255),
+                1
+            )
+
             cv2.putText(
                 frame,
                 f"height: {height:.0f} mm",
                 (
                     x,
-                    y + h + 35
+                    y + h + 69
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
                 (255, 0, 0),
                 1
             )
+
+        calibration_point = origin_pixel(
+            msg.width,
+            msg.height
+        )
+
+        cv2.drawMarker(
+            frame,
+            calibration_point,
+            (0, 0, 255),
+            cv2.MARKER_TILTED_CROSS,
+            CALIBRATION_CROSS_SIZE,
+            CALIBRATION_CROSS_THICKNESS
+        )
+
+        cv2.putText(
+            frame,
+            "0.0",
+            (
+                calibration_point[0] + 12,
+                calibration_point[1] - 12
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2
+        )
 
         # ====================================================
         # WINDOW

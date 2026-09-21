@@ -10,6 +10,12 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
+from calibration_config import (
+    WORKSPACE_HEIGHT_CM,
+    WORKSPACE_WIDTH_CM,
+    origin_pixel,
+)
+
 from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
@@ -41,6 +47,26 @@ CALIBRATION_FRAMES = 30
 PROCESS_EVERY_N_FRAMES = 3
 
 CONTOUR_EPSILON = 1.5
+
+
+def pixel_to_workspace_mm(cx, cy, image_width, image_height):
+    origin_x, origin_y = origin_pixel(
+        image_width,
+        image_height
+    )
+    x_mm = (
+        (cy - origin_y)
+        * WORKSPACE_HEIGHT_CM
+        * 10.0
+        / image_height
+    )
+    y_mm = (
+        (origin_x - cx)
+        * WORKSPACE_WIDTH_CM
+        * 10.0
+        / image_width
+    )
+    return round(x_mm, 1), round(y_mm, 1)
 
 
 # ============================================================
@@ -843,6 +869,15 @@ class CVDetectorNode(Node):
                         cx,
                         cy
                     ],
+
+                    "position_mm": list(
+                        pixel_to_workspace_mm(
+                            cx,
+                            cy,
+                            frame.shape[1],
+                            frame.shape[0]
+                        )
+                    ),
 
                     "height_mm": round(
                         height_mm,
