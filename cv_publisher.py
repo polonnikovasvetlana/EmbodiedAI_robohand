@@ -11,6 +11,9 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
 from calibration_config import (
+    TABLE_MARKER_POSITIONS_MM,
+    TABLE_MARKER_SIZE_MM,
+    TABLE_HOMOGRAPHY_FILE,
     WORKSPACE_HEIGHT_CM,
     WORKSPACE_WIDTH_CM,
     origin_pixel,
@@ -29,7 +32,7 @@ from rclpy.qos import (
 # ============================================================
 
 COLOR_TOPIC = "/camera/camera/color/image_raw"
-DEPTH_TOPIC = "/camera/camera/depth/image_rect_raw"
+DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 
 DETECTION_TOPIC = "/detected_objects"
 
@@ -37,6 +40,9 @@ MIN_HEIGHT_MM = 10.0
 MAX_HEIGHT_MM = 250.0
 
 MIN_AREA = 500
+MASK_OPEN_SIZE = 5
+MASK_CLOSE_SIZE = 9
+MARKER_EXCLUSION_MARGIN_MM = 35.0
 
 CALIBRATION_FRAMES = 30
 
@@ -49,7 +55,106 @@ PROCESS_EVERY_N_FRAMES = 3
 CONTOUR_EPSILON = 1.5
 
 
+def load_table_homography():
+    if not TABLE_HOMOGRAPHY_FILE.is_file():
+        return None
+    try:
+        payload = json.loads(
+            TABLE_HOMOGRAPHY_FILE.read_text(encoding="utf-8")
+        )
+        matrix = np.asarray(
+            payload["homography_pixel_to_mm"],
+            dtype=np.float32
+        )
+        if matrix.shape != (3, 3):
+            raise ValueError("homography must be a 3x3 matrix")
+        return matrix
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Warning: cannot load table homography: {exc}")
+        return None
+
+
+TABLE_HOMOGRAPHY = load_table_homography()
+
+
+def table_mask(image_shape):
+    if TABLE_HOMOGRAPHY is None:
+        return None
+
+    height, width = image_shape[:2]
+    inverse = np.linalg.inv(TABLE_HOMOGRAPHY).astype(np.float32)
+    positions = np.asarray(
+        [TABLE_MARKER_POSITIONS_MM[marker_id][:2] for marker_id in (0, 2, 3, 1)],
+        dtype=np.float32,
+    )
+    min_x, min_y = positions.min(axis=0)
+    max_x, max_y = positions.max(axis=0)
+    table_corners_mm = np.array(
+        [[[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]]],
+        dtype=np.float32,
+    )
+    table_corners_px = cv2.perspectiveTransform(
+        table_corners_mm,
+        inverse,
+    )[0].round().astype(np.int32)
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, table_corners_px, 255)
+
+    for marker_id in (0, 1, 2, 3):
+        center_x, center_y = TABLE_MARKER_POSITIONS_MM[marker_id][:2]
+        half_size = (
+            TABLE_MARKER_SIZE_MM / 2.0
+            + MARKER_EXCLUSION_MARGIN_MM
+        )
+        marker_corners_mm = np.array(
+            [[[
+                center_x - half_size,
+                center_y - half_size,
+            ], [
+                center_x + half_size,
+                center_y - half_size,
+            ], [
+                center_x + half_size,
+                center_y + half_size,
+            ], [
+                center_x - half_size,
+                center_y + half_size,
+            ]]],
+            dtype=np.float32,
+        )
+        marker_corners_px = cv2.perspectiveTransform(
+            marker_corners_mm,
+            inverse,
+        )[0].round().astype(np.int32)
+        cv2.fillConvexPoly(mask, marker_corners_px, 0)
+
+    return mask
+
+
+def fill_mask_holes(mask):
+    flood = mask.copy()
+    flood_mask = np.zeros(
+        (mask.shape[0] + 2, mask.shape[1] + 2),
+        dtype=np.uint8
+    )
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+    holes = cv2.bitwise_not(flood)
+    return mask | holes
+
+
 def pixel_to_workspace_mm(cx, cy, image_width, image_height):
+    if TABLE_HOMOGRAPHY is not None:
+        source = np.array(
+            [[[float(cx), float(cy)]]],
+            dtype=np.float32
+        )
+        target = cv2.perspectiveTransform(
+            source,
+            TABLE_HOMOGRAPHY
+        )[0, 0]
+        return round(float(target[0]), 1), round(float(target[1]), 1)
+
     origin_x, origin_y = origin_pixel(
         image_width,
         image_height
@@ -659,6 +764,10 @@ class CVDetectorNode(Node):
             )
         )
 
+        workspace = table_mask(depth.shape)
+        if workspace is not None:
+            object_pixels &= workspace > 0
+
         mask = (
             object_pixels.astype(
                 np.uint8
@@ -670,17 +779,26 @@ class CVDetectorNode(Node):
         # CLEAN MASK
         # ====================================================
 
+        open_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (MASK_OPEN_SIZE, MASK_OPEN_SIZE)
+        )
         mask = cv2.morphologyEx(
             mask,
             cv2.MORPH_OPEN,
-            self.kernel3
+            open_kernel
         )
 
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (MASK_CLOSE_SIZE, MASK_CLOSE_SIZE)
+        )
         mask = cv2.morphologyEx(
             mask,
             cv2.MORPH_CLOSE,
-            self.kernel5
+            close_kernel
         )
+
 
         # ====================================================
         # CONTOURS

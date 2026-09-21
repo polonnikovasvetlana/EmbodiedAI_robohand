@@ -16,7 +16,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from calibration_config import origin_pixel
+from calibration_config import TABLE_HOMOGRAPHY_FILE, origin_pixel
 
 from rclpy.qos import (
     QoSProfile,
@@ -47,6 +47,28 @@ SENSOR_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+
+def calibration_origin_pixel(image_width, image_height):
+    if TABLE_HOMOGRAPHY_FILE.is_file():
+        try:
+            payload = json.loads(
+                TABLE_HOMOGRAPHY_FILE.read_text(encoding="utf-8")
+            )
+            matrix = np.asarray(
+                payload["homography_pixel_to_mm"],
+                dtype=np.float32
+            )
+            inverse = np.linalg.inv(matrix)
+            origin = cv2.perspectiveTransform(
+                np.array([[[0.0, 0.0]]], dtype=np.float32),
+                inverse.astype(np.float32)
+            )[0, 0]
+            return tuple(np.round(origin).astype(int))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    return origin_pixel(image_width, image_height)
 
 
 # ============================================================
@@ -300,7 +322,7 @@ class CVVisualizerNode(Node):
                 1
             )
 
-        calibration_point = origin_pixel(
+        calibration_point = calibration_origin_pixel(
             msg.width,
             msg.height
         )
