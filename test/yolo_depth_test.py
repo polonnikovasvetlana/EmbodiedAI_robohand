@@ -17,11 +17,11 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from vision_msgs.msg import Detection2DArray
 
 
 COLOR_TOPIC = "/camera/camera/color/image_raw"
-DEPTH_TOPIC = "/camera/camera/depth/image_rect_raw"
+DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 DETECTION_TOPIC = "/detected_objects"
 
 SENSOR_QOS = QoSProfile(
@@ -81,7 +81,7 @@ class YoloDepthVisualizer(Node):
             SENSOR_QOS,
         )
         self.detection_subscription = self.create_subscription(
-            String,
+            Detection2DArray,
             DETECTION_TOPIC,
             self.detection_callback,
             1,
@@ -93,16 +93,56 @@ class YoloDepthVisualizer(Node):
         self.get_logger().info(f"Detections: {DETECTION_TOPIC}")
 
     def detection_callback(self, msg):
+        objects = []
+        for detection in msg.detections:
+            if not detection.results:
+                continue
+            result = detection.results[0]
+            metadata = self.parse_metadata(detection.id)
+            object_id = metadata.get("object_id", "?")
+            center = result.pose.pose.position
+            bbox = detection.bbox
+            center_px = bbox.center.position
+            half_width = bbox.size_x / 2.0
+            half_height = bbox.size_y / 2.0
+            objects.append(
+                {
+                    "id": object_id,
+                    "type": result.hypothesis.class_id,
+                    "color": metadata.get("color", "unknown"),
+                    "confidence": result.hypothesis.score,
+                    "position_mm": [center.x * 1000.0, center.y * 1000.0],
+                    "height_mm": center.z * 1000.0,
+                    "distance_mm": self.parse_float(
+                        metadata.get("distance_mm")
+                    ),
+                    "bbox": [
+                        center_px.x - half_width,
+                        center_px.y - half_height,
+                        center_px.x + half_width,
+                        center_px.y + half_height,
+                    ],
+                }
+            )
+        self.objects = objects
+        self.source_width = 640
+        self.source_height = 480
+
+    @staticmethod
+    def parse_metadata(value):
+        metadata = {}
+        for part in value.split(":"):
+            if "=" in part:
+                key, item = part.split("=", 1)
+                metadata[key] = item
+        return metadata
+
+    @staticmethod
+    def parse_float(value):
         try:
-            payload = json.loads(msg.data)
-            objects = payload.get("objects", [])
-            if not isinstance(objects, list):
-                raise ValueError("'objects' must be a list")
-            self.objects = objects
-            self.source_width = payload.get("image_width")
-            self.source_height = payload.get("image_height")
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self.get_logger().error(f"Detection message error: {exc}")
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def depth_callback(self, msg):
         try:
@@ -138,38 +178,65 @@ class YoloDepthVisualizer(Node):
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
             object_type = obj.get("type", "object")
+            color = obj.get("color", "unknown")
+            object_id = obj.get("id", "?")
             confidence = float(obj.get("confidence", 0.0))
             distance = obj.get("distance_mm")
-            label = f"{object_type} {confidence:.2f}"
+            position_mm = obj.get("position_mm")
+            height_mm = obj.get("height_mm")
+            labels = [
+                f"Object {object_id}: {object_type} {color} {confidence:.2f}"
+            ]
+            if isinstance(position_mm, list) and len(position_mm) == 2:
+                labels.append(
+                    f"X: {float(position_mm[0]):.0f} mm  "
+                    f"Y: {float(position_mm[1]):.0f} mm"
+                )
+            if height_mm is not None:
+                labels.append(f"Height: {float(height_mm):.0f} mm")
             if distance is not None:
-                label += f" | {float(distance) / 10.0:.1f} cm"
+                labels.append(f"Distance: {float(distance) / 10.0:.1f} cm")
             else:
-                label += " | distance N/A"
+                labels.append("Distance: N/A")
 
-            (text_width, text_height), _ = cv2.getTextSize(
-                label,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                1,
+            font_scale = 0.48
+            line_height = 18
+            text_sizes = [
+                cv2.getTextSize(
+                    line,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    1,
+                )[0]
+                for line in labels
+            ]
+            block_width = min(
+                max(size[0] for size in text_sizes) + 8,
+                msg.width - x1,
             )
-            text_y = max(y1 - 7, text_height + 4)
+            block_height = line_height * len(labels) + 6
+            block_x = x1
+            block_y = y2 + 4
+            if block_y + block_height > msg.height:
+                block_y = max(0, y1 - block_height - 4)
             cv2.rectangle(
                 frame,
-                (x1, text_y - text_height - 4),
-                (min(x1 + text_width + 4, msg.width - 1), text_y + 2),
+                (block_x, block_y),
+                (min(block_x + block_width, msg.width - 1), block_y + block_height),
                 (0, 0, 0),
                 -1,
             )
-            cv2.putText(
-                frame,
-                label,
-                (x1 + 2, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
+            for line_index, line in enumerate(labels):
+                cv2.putText(
+                    frame,
+                    line,
+                    (block_x + 3, block_y + 15 + line_index * line_height),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
 
         cv2.putText(
             frame,

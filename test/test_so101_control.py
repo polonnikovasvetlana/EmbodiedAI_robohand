@@ -1,6 +1,12 @@
 from so101_control import SO101Arm
 
 
+# Offsets applied to absolute `move X Y Z` targets, in millimetres.
+# Positive values move the target in the robot's positive axis direction.
+ABSOLUTE_TARGET_X_OFFSET_MM = 30.0
+ABSOLUTE_TARGET_Y_OFFSET_MM = 40.0
+
+
 def main():
 
     arm = SO101Arm()
@@ -66,8 +72,8 @@ def main():
                     continue
 
                 result = arm.move(
-                    float(parts[1]),
-                    float(parts[2]),
+                    float(parts[1]) + ABSOLUTE_TARGET_X_OFFSET_MM,
+                    float(parts[2]) + ABSOLUTE_TARGET_Y_OFFSET_MM,
                     float(parts[3]),
                 )
 

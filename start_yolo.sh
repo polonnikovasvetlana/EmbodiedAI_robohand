@@ -2,6 +2,7 @@
 
 ros2 launch realsense2_camera rs_launch.py \
     enable_sync:=true \
+    align_depth.enable:=true \
     rgb_camera.color_profile:=640x480x30 \
     depth_module.depth_profile:=640x480x30 &
 CAMERA_PID=$!

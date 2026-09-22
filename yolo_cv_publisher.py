@@ -1,7 +1,7 @@
 """ROS 2 publisher that combines YOLO detections with RealSense depth.
 
 The node is a drop-in alternative to ``cv_publisher.py``: it subscribes to
-the same color/depth topics and publishes JSON to ``/detected_objects``.
+the same color/depth topics and publishes vision_msgs to ``/detected_objects``.
 """
 
 import json
@@ -20,12 +20,14 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
 from ultralytics import YOLO
+from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
+
+from calibration_config import TABLE_HOMOGRAPHY_FILE
 
 
 COLOR_TOPIC = "/camera/camera/color/image_raw"
-DEPTH_TOPIC = "/camera/camera/depth/image_rect_raw"
+DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 DETECTION_TOPIC = "/detected_objects"
 
 CONFIDENCE = 0.40
@@ -35,6 +37,7 @@ PROCESS_EVERY_N_FRAMES = 3
 # Ignore invalid depth and obvious RealSense outliers when calculating range.
 MIN_DEPTH_MM = 100.0
 MAX_DEPTH_MM = 10000.0
+CALIBRATION_FRAMES = 30
 
 SENSOR_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
@@ -95,6 +98,54 @@ def depth_to_numpy(msg):
     raise RuntimeError(f"Unsupported depth encoding: {msg.encoding}")
 
 
+def load_table_homography():
+    if not TABLE_HOMOGRAPHY_FILE.is_file():
+        return None
+    try:
+        payload = json.loads(
+            TABLE_HOMOGRAPHY_FILE.read_text(encoding="utf-8")
+        )
+        matrix = np.asarray(
+            payload["homography_pixel_to_mm"],
+            dtype=np.float32,
+        )
+        if matrix.shape != (3, 3):
+            raise ValueError("homography must be a 3x3 matrix")
+        return matrix
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Warning: cannot load table homography: {exc}")
+        return None
+
+
+TABLE_HOMOGRAPHY = load_table_homography()
+
+
+def get_color_name(hue, saturation, value):
+    if saturation < 25:
+        if value < 55:
+            return "black"
+        if value < 170:
+            return "gray"
+        return "white"
+    if hue < 8 or hue >= 172:
+        return "red"
+    if hue < 22:
+        return "orange"
+    if hue < 38:
+        return "yellow"
+    if hue < 80:
+        return "green"
+    if hue < 100:
+        return "cyan"
+    if hue < 130:
+        return "blue"
+    if hue < 155:
+        return "purple"
+    if hue < 172:
+        return "pink"
+    return "unknown"
+
+
 class YoloCVPublisher(Node):
     def __init__(self):
         super().__init__("yolo_cv_publisher")
@@ -114,8 +165,19 @@ class YoloCVPublisher(Node):
 
         self.get_logger().info(f"Loading YOLO model: {self.model_path}")
         self.model = YOLO(self.model_path)
+        if TABLE_HOMOGRAPHY is None:
+            self.get_logger().warn(
+                "table_homography.json was not loaded; table coordinates "
+                "will be unavailable"
+            )
+        else:
+            self.get_logger().info(
+                f"Loaded table calibration: {TABLE_HOMOGRAPHY_FILE}"
+            )
 
         self.latest_depth_msg = None
+        self.calibration_frames = []
+        self.background_depth = None
         self.frame_counter = 0
         self.last_object_count = None
         self.stats_start = time.perf_counter()
@@ -133,7 +195,11 @@ class YoloCVPublisher(Node):
             self.depth_callback,
             SENSOR_QOS,
         )
-        self.publisher = self.create_publisher(String, DETECTION_TOPIC, 1)
+        self.publisher = self.create_publisher(
+            Detection2DArray,
+            DETECTION_TOPIC,
+            1,
+        )
 
         self.get_logger().info(f"RGB: {COLOR_TOPIC}")
         self.get_logger().info(f"Depth: {DEPTH_TOPIC}")
@@ -161,6 +227,10 @@ class YoloCVPublisher(Node):
             self.get_logger().error(f"Image conversion error: {exc}")
             return
 
+        if self.background_depth is None:
+            self.calibrate_depth(depth_mm)
+            return
+
         try:
             result = self.model.predict(
                 source=frame,
@@ -168,24 +238,17 @@ class YoloCVPublisher(Node):
                 iou=self.iou,
                 verbose=False,
             )[0]
-            objects = self.make_objects(result, depth_mm, frame.shape[:2])
+            objects = self.make_objects(result, frame, depth_mm)
         except Exception as exc:
             self.get_logger().error(f"YOLO inference error: {exc}")
             return
 
-        message = String()
-        message.data = json.dumps(
-            {
-                "objects": objects,
-                "image_width": int(msg.width),
-                "image_height": int(msg.height),
-                "stamp": {
-                    "sec": int(msg.header.stamp.sec),
-                    "nanosec": int(msg.header.stamp.nanosec),
-                },
-            },
-            ensure_ascii=False,
-        )
+        message = Detection2DArray()
+        message.header = msg.header
+        message.detections = [
+            self.to_ros_detection(obj)
+            for obj in objects
+        ]
         self.publisher.publish(message)
 
         if len(objects) != self.last_object_count:
@@ -194,14 +257,37 @@ class YoloCVPublisher(Node):
 
         self.report_performance(started)
 
-    def make_objects(self, result, depth_mm, color_shape):
-        """Build the JSON objects, including range from each YOLO box."""
+    def calibrate_depth(self, depth_mm):
+        depth_float = depth_mm.astype(np.float32)
+        depth_float[depth_float <= 0] = np.nan
+        self.calibration_frames.append(depth_float)
+        count = len(self.calibration_frames)
+        if count == 1:
+            self.get_logger().info(
+                "Keep the table empty: starting YOLO table calibration..."
+            )
+        if count % 5 == 0:
+            self.get_logger().info(
+                f"YOLO calibration: {count}/{CALIBRATION_FRAMES}"
+            )
+        if count < CALIBRATION_FRAMES:
+            return
+        with np.errstate(all="ignore"):
+            self.background_depth = np.nanmedian(
+                np.stack(self.calibration_frames, axis=0),
+                axis=0,
+            ).astype(np.float32)
+        self.calibration_frames.clear()
+        self.get_logger().info("YOLO table calibration finished.")
+
+    def make_objects(self, result, frame, depth_mm):
+        """Build objects with table coordinates, height, range, and colour."""
         detected = []
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             return detected
 
-        color_height, color_width = color_shape
+        color_height, color_width = frame.shape[:2]
         depth_height, depth_width = depth_mm.shape
         names = result.names
 
@@ -222,6 +308,8 @@ class YoloCVPublisher(Node):
             dy1, dy2 = np.clip((dy1, dy2), 0, depth_height).astype(int)
 
             distance_mm = self.box_distance(depth_mm[dy1:dy2, dx1:dx2])
+            height_mm = self.box_height(depth_mm[dy1:dy2, dx1:dx2], x1, y1, x2, y2)
+            color = self.box_color(frame[y1:y2, x1:x2])
             if isinstance(names, dict):
                 class_name = str(names.get(class_id, class_id))
             elif 0 <= class_id < len(names):
@@ -230,17 +318,17 @@ class YoloCVPublisher(Node):
                 class_name = str(class_id)
             center_x = (x1 + x2) // 2
             center_y = (y1 + y2) // 2
+            position_mm = self.pixel_to_table_mm(center_x, center_y)
 
             detected.append(
                 {
                     "type": class_name,
-                    # Kept for consumers written for cv_publisher.py. YOLO
-                    # does not classify colour or height above the table.
-                    "color": "unknown",
-                    "height_mm": 0.0,
+                    "color": color,
+                    "height_mm": height_mm,
                     "class_id": int(class_id),
                     "confidence": round(float(confidence), 3),
                     "position": [center_x, center_y],
+                    "position_mm": position_mm,
                     "bbox": [x1, y1, x2, y2],
                     # Rectangle contour keeps cv_publisher consumers working.
                     "contour": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
@@ -252,6 +340,69 @@ class YoloCVPublisher(Node):
         for object_id, obj in enumerate(detected, start=1):
             obj["id"] = object_id
         return detected
+
+    @staticmethod
+    def to_ros_detection(obj):
+        detection = Detection2D()
+        x1, y1, x2, y2 = obj["bbox"]
+        detection.id = (
+            f"object_id={obj['id']}:color={obj['color']}:"
+            f"distance_mm={obj['distance_mm']}"
+        )
+        detection.bbox.center.position.x = (x1 + x2) / 2.0
+        detection.bbox.center.position.y = (y1 + y2) / 2.0
+        detection.bbox.size_x = float(x2 - x1)
+        detection.bbox.size_y = float(y2 - y1)
+
+        result = ObjectHypothesisWithPose()
+        result.hypothesis.class_id = str(obj["type"])
+        result.hypothesis.score = float(obj["confidence"])
+        position_mm = obj.get("position_mm")
+        if isinstance(position_mm, list) and len(position_mm) == 2:
+            result.pose.pose.position.x = float(position_mm[0]) / 1000.0
+            result.pose.pose.position.y = float(position_mm[1]) / 1000.0
+        result.pose.pose.position.z = float(obj.get("height_mm", 0.0)) / 1000.0
+        detection.results = [result]
+        return detection
+
+    @staticmethod
+    def box_color(roi):
+        if roi.size == 0:
+            return "unknown"
+        height, width = roi.shape[:2]
+        margin_x = width // 4
+        margin_y = height // 4
+        central = roi[
+            margin_y : max(margin_y + 1, height - margin_y),
+            margin_x : max(margin_x + 1, width - margin_x),
+        ]
+        hsv = cv2.cvtColor(central, cv2.COLOR_BGR2HSV)
+        median = np.median(hsv.reshape(-1, 3), axis=0)
+        return get_color_name(*median.astype(int))
+
+    def box_height(self, depth_roi, x1, y1, x2, y2):
+        if self.background_depth is None or depth_roi.size == 0:
+            return 0.0
+        background_roi = self.background_depth[y1:y2, x1:x2]
+        valid = (
+            np.isfinite(background_roi)
+            & np.isfinite(depth_roi)
+            & (depth_roi >= MIN_DEPTH_MM)
+            & (depth_roi <= MAX_DEPTH_MM)
+        )
+        differences = background_roi[valid] - depth_roi[valid]
+        differences = differences[(differences > 0) & (differences < 1000)]
+        if differences.size == 0:
+            return 0.0
+        return round(float(np.percentile(differences, 75)), 1)
+
+    @staticmethod
+    def pixel_to_table_mm(x, y):
+        if TABLE_HOMOGRAPHY is None:
+            return None
+        point = np.array([[[float(x), float(y)]]], dtype=np.float32)
+        table_point = cv2.perspectiveTransform(point, TABLE_HOMOGRAPHY)[0, 0]
+        return [round(float(table_point[0]), 1), round(float(table_point[1]), 1)]
 
     @staticmethod
     def clip_box(coords, width, height):

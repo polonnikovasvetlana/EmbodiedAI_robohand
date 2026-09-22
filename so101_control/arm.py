@@ -153,17 +153,16 @@ class SO101Config:
     gripper_tolerance_rad: float = 0.03
 
     # Current feedback is supplied by the patched Feetech driver in amperes.
-    # The STS3215 is about 0.18 A with no load, so 0.25 A intentionally
-    # favors early/false contact over excessive squeeze. Tune only with
-    # disposable test objects, never a hand.
-    gripper_contact_current_amp: float = 0.25
+    # Continue closing past light contact and stop only at a firmer grip.
+    # Tune only with disposable test objects, never a hand.
+    gripper_contact_current_amp: float = 0.60
     gripper_contact_samples: int = 2
     gripper_current_poll_interval: float = 0.02
     gripper_close_timeout: float = 25.0
 
-    # After current-triggered contact, hold the measured position. A zero
-    # preload avoids adding extra squeeze; increase only after safe testing.
-    gripper_grasp_preload_rad: float = 0.0
+    # After current-triggered contact, close a little farther to preload the
+    # object against the opposite jaw. Positive values mean more squeezing.
+    gripper_grasp_preload_rad: float = 0.20
     gripper_hold_timeout: float = 3.0
 
     server_timeout: float = 10.0
@@ -1717,17 +1716,6 @@ class SO101Arm:
                     "No gripper state.",
                 )
 
-            if allow_stall:
-
-                return MotionResult(
-                    False,
-                    (
-                        "Velocity-stall grasping is "
-                        "disabled as unsafe. Use close(), "
-                        "which requires current feedback."
-                    ),
-                )
-
             self._node.get_logger().info(
                 f"GRIPPER → "
                 f"{target:.3f} rad "
@@ -1823,6 +1811,10 @@ class SO101Arm:
                     .gripper_tolerance_rad
                 )
 
+                moved = (
+                    abs(after - before) > 0.01
+                )
+
                 if reached:
 
                     return MotionResult(
@@ -1830,6 +1822,21 @@ class SO101Arm:
                         (
                             f"Gripper reached "
                             f"{after:.3f}"
+                        ),
+                    )
+
+                if (
+                    allow_stall
+                    and result.stalled
+                    and moved
+                ):
+
+                    return MotionResult(
+                        True,
+                        (
+                            "Gripper stalled after "
+                            f"moving to {after:.3f}; "
+                            "holding contact."
                         ),
                     )
 
@@ -2156,8 +2163,13 @@ class SO101Arm:
                         self._current_gripper_goal = None
 
     def close(self):
-
-        return self._close_with_current_feedback()
+        return self.set_gripper(
+            self.config.gripper_closed_position,
+            allow_stall=True,
+        )
+    # def close(self):
+        
+    # return self._close_with_current_feedback()
 
     # ========================================================
     # STOP
