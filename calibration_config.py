@@ -24,9 +24,9 @@ MANIPULATOR_MARKER_SIZE_MM = 25.0
 # Replace the example values with ruler measurements before using ArUco pose.
 TABLE_MARKER_POSITIONS_MM = {
     0: (0.0, -210.0, 0.0),
-    1: (255.0, -210.0, 0.0),
-    2: (0.0, 230.0, 0.0),
-    3: (360.0, 230.0, 0.0),
+    1: (280.0, -210.0, 0.0),
+    2: (0.0, 210.0, 0.0),
+    3: (360.0, 210.0, 0.0),
 }
 
 # Offset from the centre of marker 10 to the robot TCP/gripper point.
