@@ -5,7 +5,6 @@ the same color/depth topics and publishes vision_msgs to ``/detected_objects``.
 """
 
 import json
-import os
 import time
 from pathlib import Path
 
@@ -48,23 +47,11 @@ SENSOR_QOS = QoSProfile(
 
 
 def default_model_path():
-    """Find the bundled model, while allowing an explicit environment override."""
-    override = os.environ.get("YOLO_MODEL_PATH")
-    if override:
-        return override
-
-    project_dir = Path(__file__).resolve().parent
-    candidates = (
-        project_dir / "yolo26n.pt",
-        project_dir / "test" / "yolo26n.pt",
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-
-    # Ultralytics can resolve/download a known model name when networking is
-    # available. The error it produces is also clearer than a made-up path.
-    return "yolo26n.pt"
+    """Return only the project-trained weights; never fall back to COCO."""
+    model_path = Path(__file__).resolve().parent / "best.pt"
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Custom YOLO weights not found: {model_path}")
+    return str(model_path)
 
 
 def image_to_numpy(msg):
@@ -150,12 +137,11 @@ class YoloCVPublisher(Node):
     def __init__(self):
         super().__init__("yolo_cv_publisher")
 
-        self.declare_parameter("model", default_model_path())
         self.declare_parameter("confidence", CONFIDENCE)
         self.declare_parameter("iou", IOU)
         self.declare_parameter("process_every_n_frames", PROCESS_EVERY_N_FRAMES)
 
-        self.model_path = str(self.get_parameter("model").value)
+        self.model_path = default_model_path()
         self.confidence = float(self.get_parameter("confidence").value)
         self.iou = float(self.get_parameter("iou").value)
         self.process_every_n_frames = max(
@@ -165,6 +151,7 @@ class YoloCVPublisher(Node):
 
         self.get_logger().info(f"Loading YOLO model: {self.model_path}")
         self.model = YOLO(self.model_path)
+        self.get_logger().info(f"YOLO classes: {self.model.names}")
         if TABLE_HOMOGRAPHY is None:
             self.get_logger().warn(
                 "table_homography.json was not loaded; table coordinates "
