@@ -1,3 +1,10 @@
+import os
+
+# The SO-101 bringup in this project runs on Cyclone DDS.  Force the executor
+# to use the same middleware before importing rclpy; mixing it with Fast DDS
+# breaks variable-size action messages such as ParallelGripperCommand goals.
+os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+
 import json
 import math
 import queue
@@ -7,6 +14,7 @@ import uuid
 
 import rclpy
 from rclpy.node import Node
+from rclpy.utilities import get_rmw_implementation_identifier
 from std_msgs.msg import String
 
 from so101_control import SO101Arm
@@ -16,7 +24,7 @@ from so101_control import SO101Arm
 # TOPICS
 # ============================================================
 
-COMMAND_TOPIC = "/agent/robot_command"
+COMMAND_TOPIC = "/voice/robot_command"
 STATUS_TOPIC = "/robot_executor/status"
 
 
@@ -24,8 +32,9 @@ STATUS_TOPIC = "/robot_executor/status"
 # CALIBRATION
 # ============================================================
 
-ABSOLUTE_TARGET_X_OFFSET_MM = 30.0
-ABSOLUTE_TARGET_Y_OFFSET_MM = 40.0
+ABSOLUTE_TARGET_X_OFFSET_MM = 25.0
+ABSOLUTE_TARGET_Y_OFFSET_MM = 50.0
+CAMERA_GRASP_Z_OFFSET_MM = 35.0
 
 
 # Если робот физически приехал достаточно близко,
@@ -43,6 +52,11 @@ class RobotExecutor(Node):
     def __init__(self):
 
         super().__init__("robot_executor")
+
+        self.get_logger().info(
+            "ROS middleware: "
+            f"{get_rmw_implementation_identifier()}"
+        )
 
         # ====================================================
         # ROBOT
@@ -374,9 +388,26 @@ class RobotExecutor(Node):
                 step["y"]
             )
 
-            z = float(
+            z_raw = float(
                 step["z"]
             )
+
+            frame = str(
+                step.get("frame", "")
+            ).strip().lower()
+
+            # Camera detections describe the top of the object. Move the
+            # gripper 20 mm lower for the grasp, but never below table Z=0.
+            if (
+                frame == "camera"
+                and math.isfinite(z_raw)
+            ):
+                z = max(
+                    -10.0,
+                    z_raw - CAMERA_GRASP_Z_OFFSET_MM,
+                )
+            else:
+                z = z_raw
 
             # calibration offsets
 
@@ -392,10 +423,20 @@ class RobotExecutor(Node):
 
             self.get_logger().info(
                 f"MOVE RAW → "
+                f"frame={frame or 'unspecified'} "
                 f"x={x_raw:.1f} "
                 f"y={y_raw:.1f} "
-                f"z={z:.1f}"
+                f"z={z_raw:.1f}"
             )
+
+            if frame == "camera":
+
+                self.get_logger().info(
+                    f"CAMERA GRASP Z → "
+                    f"max(0.0, {z_raw:.1f} - "
+                    f"{CAMERA_GRASP_Z_OFFSET_MM:.1f}) "
+                    f"= {z:.1f} mm"
+                )
 
             self.get_logger().info(
                 f"MOVE CALIBRATED → "

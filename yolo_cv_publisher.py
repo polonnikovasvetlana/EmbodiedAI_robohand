@@ -122,8 +122,6 @@ def get_color_name(hue, saturation, value):
         return "yellow"
     if hue < 80:
         return "green"
-    if hue < 100:
-        return "cyan"
     if hue < 130:
         return "blue"
     if hue < 155:

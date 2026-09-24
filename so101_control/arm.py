@@ -153,16 +153,17 @@ class SO101Config:
     gripper_tolerance_rad: float = 0.03
 
     # Current feedback is supplied by the patched Feetech driver in amperes.
-    # Continue closing past light contact and stop only at a firmer grip.
+    # About twenty-three STS current counts give a firmer grip while still
+    # stopping well below the motor protection-current limit.
     # Tune only with disposable test objects, never a hand.
-    gripper_contact_current_amp: float = 0.60
-    gripper_contact_samples: int = 2
+    gripper_contact_current_amp: float = 0.150
+    # One over-current sample stops immediately.
+    gripper_contact_samples: int = 1
     gripper_current_poll_interval: float = 0.02
     gripper_close_timeout: float = 25.0
 
-    # After current-triggered contact, close a little farther to preload the
-    # object against the opposite jaw. Positive values mean more squeezing.
-    gripper_grasp_preload_rad: float = 0.20
+    # Add only a small preload after contact to retain the object.
+    gripper_grasp_preload_rad: float = 0.050
     gripper_hold_timeout: float = 3.0
 
     server_timeout: float = 10.0
@@ -1719,9 +1720,25 @@ class SO101Arm:
             self._node.get_logger().info(
                 f"GRIPPER → "
                 f"{target:.3f} rad "
-                f"(current="
+                f"(position="
                 f"{before:.3f})"
             )
+
+            position_error = abs(before - target)
+
+            if (
+                position_error
+                <= self.config.gripper_tolerance_rad
+            ):
+
+                return MotionResult(
+                    True,
+                    (
+                        "Gripper is already at target "
+                        f"({before:.3f} rad, "
+                        f"error={position_error:.3f} rad)."
+                    ),
+                )
 
             goal = (
                 ParallelGripperCommand.Goal()
@@ -2121,9 +2138,46 @@ class SO101Arm:
                                 ),
                             )
 
-                        self._hold_gripper_after_contact(
-                            after
-                        )
+                        moved = abs(after - before) > 0.05
+
+                        if (
+                            wrapped_result.result.stalled
+                            and moved
+                        ):
+                            (
+                                held,
+                                hold_target,
+                                hold_message,
+                            ) = self._hold_gripper_after_contact(
+                                after
+                            )
+
+                            if held:
+                                current_text = (
+                                    f"{abs(current):.3f} A"
+                                    if current is not None
+                                    else "unavailable"
+                                )
+
+                                return MotionResult(
+                                    True,
+                                    (
+                                        "Object/contact detected by "
+                                        "controller stall at "
+                                        f"{after:.3f} rad "
+                                        f"(current={current_text}); "
+                                        "holding at "
+                                        f"{hold_target:.3f} rad."
+                                    ),
+                                )
+
+                            return MotionResult(
+                                False,
+                                (
+                                    "Gripper stalled on contact, but "
+                                    f"{hold_message}."
+                                ),
+                            )
 
                         return MotionResult(
                             False,
@@ -2163,13 +2217,7 @@ class SO101Arm:
                         self._current_gripper_goal = None
 
     def close(self):
-        return self.set_gripper(
-            self.config.gripper_closed_position,
-            allow_stall=True,
-        )
-    # def close(self):
-        
-    # return self._close_with_current_feedback()
+        return self._close_with_current_feedback()
 
     # ========================================================
     # STOP
