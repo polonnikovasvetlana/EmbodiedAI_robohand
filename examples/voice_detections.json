@@ -1,0 +1,8 @@
+{
+  "objects": [
+    {"id": 1, "type": "bottle", "confidence": 0.92, "position": [210, 180], "distance_mm": 650.0, "height_mm": 0.0},
+    {"id": 2, "type": "cup", "confidence": 0.89, "position": [400, 240], "distance_mm": 680.0, "height_mm": 0.0}
+  ],
+  "image_width": 640,
+  "image_height": 480
+}

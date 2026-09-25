@@ -1,0 +1,5 @@
+# Install only if missing from agent35. ROS packages belong to your ROS installation.
+faster-whisper>=1.1,<2
+sounddevice>=0.5,<1
+numpy>=1.26,<3
+scipy>=1.11,<2
