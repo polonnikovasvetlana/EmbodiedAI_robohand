@@ -1,9 +1,9 @@
 import os
 
-# The SO-101 bringup in this project runs on Cyclone DDS.  Force the executor
-# to use the same middleware before importing rclpy; mixing it with Fast DDS
-# breaks variable-size action messages such as ParallelGripperCommand goals.
-os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+# All ROS processes on both computers must use the same middleware.  The
+# remote agent runs on Fast DDS, so keep the executor on Fast DDS as well.
+# MoveIt and the controllers must be launched with the same setting.
+os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
 
 import json
 import math
@@ -397,13 +397,13 @@ class RobotExecutor(Node):
             ).strip().lower()
 
             # Camera detections describe the top of the object. Move the
-            # gripper 20 mm lower for the grasp, but never below table Z=0.
+            # gripper lower for the grasp, but never below table Z=0.
             if (
                 frame == "camera"
                 and math.isfinite(z_raw)
             ):
                 z = max(
-                    -10.0,
+                    0.0,
                     z_raw - CAMERA_GRASP_Z_OFFSET_MM,
                 )
             else:

@@ -6,6 +6,7 @@ the same color/depth topics and publishes vision_msgs to ``/detected_objects``.
 
 import json
 import time
+import warnings
 from pathlib import Path
 
 import cv2
@@ -257,7 +258,10 @@ class YoloCVPublisher(Node):
             )
         if count < CALIBRATION_FRAMES:
             return
-        with np.errstate(all="ignore"):
+        with warnings.catch_warnings():
+            # RealSense legitimately has pixels with no depth in every
+            # calibration frame. They stay NaN and must not spam the console.
+            warnings.simplefilter("ignore", RuntimeWarning)
             self.background_depth = np.nanmedian(
                 np.stack(self.calibration_frames, axis=0),
                 axis=0,

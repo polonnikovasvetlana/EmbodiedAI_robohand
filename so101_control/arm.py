@@ -8,6 +8,11 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+# Every ROS process in this project must use the same DDS implementation.
+# The remote agent and robot_executor.py use Fast DDS, so direct users of this
+# module must use Fast DDS too.
+os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+
 import rclpy
 
 from action_msgs.msg import GoalStatus
@@ -165,6 +170,12 @@ class SO101Config:
     # Add only a small preload after contact to retain the object.
     gripper_grasp_preload_rad: float = 0.050
     gripper_hold_timeout: float = 3.0
+
+    # The action server becomes discoverable shortly before ros2_control
+    # finishes activating the gripper controller.  Retry goals that are
+    # explicitly rejected during that small startup window.
+    gripper_goal_retries: int = 6
+    gripper_goal_retry_delay: float = 0.20
 
     server_timeout: float = 10.0
     command_timeout: float = 30.0
@@ -1563,6 +1574,51 @@ class SO101Arm:
     # GRIPPER
     # ========================================================
 
+    def _send_gripper_goal(
+        self,
+        goal: ParallelGripperCommand.Goal,
+    ):
+
+        attempts = max(
+            1,
+            int(self.config.gripper_goal_retries),
+        )
+
+        for attempt in range(attempts):
+
+            goal_handle = self._wait_future(
+                self._gripper_client.send_goal_async(goal),
+                self.config.server_timeout,
+            )
+
+            # A timeout is ambiguous: the server may still accept the goal
+            # later, so sending a duplicate would be unsafe.
+            if goal_handle is None:
+                return None
+
+            if goal_handle.accepted:
+                return goal_handle
+
+            if attempt + 1 < attempts:
+
+                if attempt == 0:
+                    self._node.get_logger().warning(
+                        "Gripper controller rejected a goal while starting; "
+                        "waiting for it to become active."
+                    )
+
+                time.sleep(
+                    max(
+                        0.0,
+                        float(
+                            self.config
+                            .gripper_goal_retry_delay
+                        ),
+                    )
+                )
+
+        return goal_handle
+
     def _gripper_hold_target(
         self,
         contact_position: float,
@@ -1624,11 +1680,7 @@ class SO101Arm:
             hold_target
         ]
 
-        goal_handle = self._wait_future(
-            self._gripper_client
-            .send_goal_async(goal),
-            self.config.server_timeout,
-        )
+        goal_handle = self._send_gripper_goal(goal)
 
         if (
             goal_handle is None
@@ -1752,15 +1804,7 @@ class SO101Arm:
                 target
             ]
 
-            goal_handle = (
-                self._wait_future(
-                    self._gripper_client
-                    .send_goal_async(goal),
-
-                    self.config
-                    .server_timeout,
-                )
-            )
+            goal_handle = self._send_gripper_goal(goal)
 
             if (
                 goal_handle is None
@@ -1998,11 +2042,7 @@ class SO101Arm:
 
             goal.command.position = [target]
 
-            goal_handle = self._wait_future(
-                self._gripper_client
-                .send_goal_async(goal),
-                self.config.server_timeout,
-            )
+            goal_handle = self._send_gripper_goal(goal)
 
             if (
                 goal_handle is None
